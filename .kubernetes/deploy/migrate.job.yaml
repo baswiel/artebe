@@ -1,0 +1,29 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{NAMESPACE}}-migrate
+  labels:
+    component: migrate
+    release: {{RELEASE}}
+    tenant: rapide
+spec:
+  backoffLimit: 3
+  parallelism: 1
+  template:
+    spec:
+      containers:
+        - args:
+            - php
+            - /app/artisan
+            - migrate
+            - --force
+          envFrom:
+            - configMapRef:
+                name: env
+          name: job
+          image: {{IMAGE}}
+          imagePullPolicy: Always
+          workingDir: /app
+      imagePullSecrets:
+        - name: regcred
+      restartPolicy: Never

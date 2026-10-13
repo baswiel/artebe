@@ -1,0 +1,299 @@
+version: 2.1
+
+parameters:
+  registry:
+    type: string
+    default: "harbor.k8s.rapide.software"
+  registry-org:
+    type: string
+    default: "rapide"
+  registry-repo:
+    type: string
+    default: "{project-name}"
+  ns-org:
+    type: string
+    default: "rapide"
+  ns-project:
+    type: string
+    default: "{project-name}"
+  git-repo:
+    type: string
+    default: "{project-name}"
+  php-version:
+    type: string
+    default: "8.5"
+  sentry-project:
+    type: string
+    default: "{project-name}"
+  has-worker:
+    type: boolean
+    default: false
+  has-cron:
+    type: boolean
+    default: false
+  migrate:
+    type: boolean
+    default: false
+
+install_composer: &install_composer
+  command: |
+    php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');"
+    php -r "if (hash_file('SHA384', 'composer-setup.php') === trim(file_get_contents('https://composer.github.io/installer.sig'))) { echo 'Installer verified'; } else { echo 'Installer invalid'; unlink('composer-setup.php'); } echo PHP_EOL;"
+    sudo php composer-setup.php --quiet --install-dir /usr/local/bin --filename composer
+    RESULT=$?
+    rm composer-setup.php
+    exit $RESULT
+orbs:
+  kubernetes: circleci/kubernetes@2.0.2
+
+jobs:
+  unit:
+    docker:
+      # specify the version you desire here
+      - image: cimg/php:<< pipeline.parameters.php-version >>
+      - image: cimg/mysql:9.5
+        environment:
+          MYSQL_ROOT_PASSWORD: secret
+          MYSQL_DATABASE: circleci
+          MYSQL_USER: default
+          MYSQL_PASSWORD: secret
+
+    # Specify service dependencies here if necessary
+    # CircleCI maintains a library of pre-built images
+    # documented at https://circleci.com/docs/2.0/circleci-images/
+    # - image: circleci/mysql:9.4
+
+    working_directory: ~/repo
+
+    steps:
+      - run:
+          name: "Add alias to ssh config"
+          command: |
+            mkdir -p ~/.ssh
+            echo 'Host circleci.database' | sudo tee -a ~/.ssh/config
+            echo '  Hostname github.com' | sudo tee -a ~/.ssh/config
+      - checkout
+      # Download and cache dependencies
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ checksum "composer.json" }}
+            # fallback to using the latest cache if no exact match is found
+            - v1-dependencies-
+
+      - run:
+          <<: *install_composer
+
+      - run: cp .env.ci .env
+
+      - run: composer install -n --prefer-dist --ignore-platform-reqs --no-progress
+
+      - save_cache:
+          paths:
+            - ./vendor
+          key: v1-dependencies-{{ checksum "composer.json" }}
+
+      # run tests!
+      - run:
+          command: |
+            mkdir -p ~/phpunit
+            vendor/bin/phpunit -c phpunit.xml --testsuite Unit --log-junit ~/phpunit/junit.xml
+      - store_test_results:
+          path: ~/phpunit
+      - store_artifacts:
+          path: ~/phpunit
+      - store_artifacts:
+          path: ./storage/logs
+          destination: laravel
+  release:
+    docker:
+      - image: cimg/node:lts
+    environment:
+      SENTRY_URL: https://sentry.rapide.nl/
+      SENTRY_ORG: rapideinternet
+      SENTRY_PROJECT: << pipeline.parameters.sentry-project >>
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - node-v1-{{ .Branch }}-{{ checksum "package-lock.json" }}
+      - run:
+          name: Installing npm
+          command: npm install
+      - save_cache:
+          paths:
+            - /home/circleci/node_modules
+          key: node-v1-{{ .Branch }}-{{ checksum "package-lock.json" }}
+      - run:
+          name: Validate environment variables
+          command: |
+            if [ -z "$CIRCLE_PULL_REQUEST" ] || [ -z "$CIRCLE_PR_NUMBER " ]; then echo "No pull request found, continue releasing"; exit 0; else echo "Pull request variable is set, remove if you want to deploy."; exit 1; fi;
+      - run:
+          name: Running semantic-release
+          command: npx semantic-release --force
+      - run:
+          name: Determine version of build
+          command: echo 'export VERSION=$(git describe --tags --abbrev=0 | cut -f1 -d"@")' >> $BASH_ENV
+
+  build:
+    parameters:
+      release:
+        type: string
+    machine:
+      image: ubuntu-2604:current
+      docker_layer_caching: false
+    environment:
+      REGISTRY: << pipeline.parameters.registry >>
+      REGISTRYORG: << pipeline.parameters.registry-org >>
+      REGISTRYREPO: << pipeline.parameters.registry-repo >>
+      GITREPO: << pipeline.parameters.git-repo >>
+    steps:
+      - run:
+          name: Add alias to ssh config
+          command: |
+            mkdir -p ~/.ssh
+            echo 'Host circleci.database' | sudo tee -a ~/.ssh/config
+            echo '  Hostname github.com' | sudo tee -a ~/.ssh/config
+      - checkout
+      - run:
+          name: Determine version of build
+          command: echo 'export VERSION=$(git describe --tags --abbrev=0 | cut -f1 -d"@")' >> $BASH_ENV
+      - run:
+          name: Print version
+          command: echo $VERSION
+      - run:
+          name: Check if version is tagged with a version
+          command: if [[ -z "$VERSION" ]]; then echo "Repo is is not tagged with a version"; exit 1; fi
+      - run:
+          name: Build image
+          command: docker build --rm=true
+            --build-arg REGISTRY_URL=${REGISTRY}
+            --build-arg PROJECT_NAME=${REGISTRYORG}
+            --tag=${REGISTRY}/${REGISTRYORG}/${REGISTRYREPO}:${VERSION} -f .docker/Dockerfile
+            --build-arg repo==git@api:rapideinternet/${GITREPO}.git .
+      - run:
+          name: Push to harbor
+          command: |
+            echo $DOCKER_PASSWORD | docker login --username $DOCKER_USERNAME --password-stdin ${REGISTRY}
+            docker push ${REGISTRY}/${REGISTRYORG}/${REGISTRYREPO}:${VERSION}
+
+  deploy:
+    parameters:
+      release:
+        type: string
+    docker:
+      - image: docker.io/cimg/deploy:2026.02
+    resource_class: rapideinternet/deployment-runners
+    environment:
+      REGISTRY: << pipeline.parameters.registry >>
+      REGISTRYORG: << pipeline.parameters.registry-org >>
+      REGISTRYREPO: << pipeline.parameters.registry-repo >>
+      NSORG: << pipeline.parameters.ns-org >>
+      NSPROJECT: << pipeline.parameters.ns-project >>
+    steps:
+      - checkout:
+          path: ~/project
+      - run:
+          name: Setup environment
+          command: |
+            export VERSION=$(cd ~/project && git describe --tags --abbrev=0 | cut -f1 -d"@")
+            export RELEASE="<< parameters.release >>"
+            echo "export VERSION=$VERSION" >> $BASH_ENV
+            echo "export REGISTRY=${REGISTRY}" >> $BASH_ENV
+            echo "export REGISTRYORG=${REGISTRYORG}" >> $BASH_ENV
+            echo "export REGISTRYREPO=${REGISTRYREPO}" >> $BASH_ENV
+            echo "export RELEASE=$RELEASE" >> $BASH_ENV
+            echo "export NAMESPACE=$NSORG-$RELEASE-$NSPROJECT" >> $BASH_ENV
+            echo "export IMAGE=${REGISTRY}\\\/${REGISTRYORG}\\\/${REGISTRYREPO}:$VERSION" >> $BASH_ENV
+      - run:
+          name: Deploy version config
+          command: |
+            cd ~/project
+            cat "./.kubernetes/deploy/version.configmap.yaml" | sed "s/{{VERSION}}/$VERSION/g" | sed "s/{{SHA1}}/$CIRCLE_SHA1/g" | sed "s/{{RELEASE}}/$RELEASE/g" | kubectl -n $NAMESPACE apply -f -
+      - when:
+          condition: << pipeline.parameters.migrate >>
+          steps:
+            - run:
+                name: Run migrate
+                command: |
+                  cd ~/project
+                  kubectl -n $NAMESPACE delete job "$NAMESPACE-migrate" --ignore-not-found
+                  cat "./.kubernetes/deploy/migrate.job.yaml" | sed "s/{{NAMESPACE}}/$NAMESPACE/g" | sed "s/{{IMAGE}}/$IMAGE/g" | sed "s/{{RELEASE}}/$RELEASE/g" | kubectl -n $NAMESPACE apply -f -
+                  kubectl -n $NAMESPACE wait --for=condition=complete --timeout=1h job "$NAMESPACE-migrate"
+      - run:
+          name: Update app nodes
+          command: |
+            kubectl -n $NAMESPACE set image deployment --selector='component=app' app=$REGISTRY/$REGISTRYORG/$REGISTRYREPO:$VERSION
+            kubectl -n $NAMESPACE rollout status deployment --selector='component=app' --timeout=2m
+      - when:
+          condition: << pipeline.parameters.has-cron >>
+          steps:
+            - run:
+                name: Update cron
+                command: kubectl -n $NAMESPACE set image cronjob --selector='component=cron' cron=$REGISTRY/$REGISTRYORG/$REGISTRYREPO:$VERSION
+      - when:
+          condition: << pipeline.parameters.has-worker >>
+          steps:
+            - run:
+                name: Update worker nodes
+                command: |
+                  kubectl -n $NAMESPACE set image deployment --selector='component=worker' worker=$REGISTRY/$REGISTRYORG/$REGISTRYREPO:$VERSION
+                  kubectl -n $NAMESPACE rollout status deployment --selector='component=worker' --timeout=2m
+
+  notify-jira:
+    docker:
+      - image: cimg/base:stable
+    steps:
+      - jira/notify
+
+workflows:
+  version: 2
+  test-build-and-deploy:
+    jobs:
+      - unit
+      - release:
+          requires:
+            - unit
+          filters:
+            branches:
+              only:
+                - staging
+                - production
+      - build:
+          name: build-staging
+          release: "staging"
+          requires:
+            - release
+          filters:
+            branches:
+              only:
+                - staging
+
+      - deploy:
+          name: deploy-staging
+          release: "staging"
+          requires:
+            - build-staging
+          filters:
+            branches:
+              only:
+                - staging
+
+      - build:
+          name: build-production
+          release: "production"
+          requires:
+            - release
+          filters:
+            branches:
+              only:
+                - production
+
+      - deploy:
+          name: deploy-production
+          release: "production"
+          requires:
+            - build-production
+          filters:
+            branches:
+              only:
+                - production

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: version
+  labels:
+    component: version
+    release: {{RELEASE}}
+    tenant: rapide
+data:
+  APP_VERSION: {{VERSION}}
+  APP_SHA1: {{SHA1}}

@@ -1,0 +1,3 @@
+interface:
+  display_name: "Start New Project"
+  short_description: "Interactive discovery for new Rapide Laravel projects"
